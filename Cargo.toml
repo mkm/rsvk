@@ -1,0 +1,16 @@
+[package]
+name = "rsvk"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+xcb = { version = "1.1.1", path = "../rust-xcb" }
+vulkano = { version = "0.31.1" }
+vulkano-shaders = { version = "0.31.1" }
+bytemuck = { version = "1.12.1" }
+
+[features]
+validation = []
+api_dump = []
