@@ -1,15 +1,17 @@
+#![feature(try_blocks)]
+
 use std::error::Error;
 use std::borrow::Borrow;
 use std::sync::Arc;
-use std::time::Duration;
-use std::ptr::null;
+use std::collections::VecDeque;
+use std::time::{Instant, Duration};
+use std::os::unix::io::AsRawFd;
 use xcb::{x, Xid};
 use vulkano::{
     VulkanLibrary,
-    VulkanObject,
     instance::{Instance, InstanceExtensions, InstanceCreateInfo, LayerProperties},
     device::{Device, DeviceExtensions, Features, DeviceCreateInfo, Queue, QueueCreateInfo, physical::PhysicalDevice},
-    swapchain::{self, Swapchain, SwapchainCreateInfo, Surface, PresentMode, PresentInfo, display::Display},
+    swapchain::{self, Swapchain, SwapchainCreateInfo, Surface, PresentMode, PresentInfo},
     image::{
         ImageLayout,
         ImageAccess,
@@ -33,21 +35,26 @@ use vulkano::{
             color_blend::{ColorBlendState, ColorBlendAttachmentState, ColorComponents, AttachmentBlend},
         },
     },
-    sync::{Fence, GpuFuture, PipelineStage},
+    sync::{GpuFuture, FenceSignalFuture},
     buffer::cpu_pool::CpuBufferPool,
     descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet},
-    query::{QueryPool, QueryPoolCreateInfo, QueryType, QueryControlFlags, QueryResultFlags},
 };
 
+#[macro_use]
+mod prelude;
 mod maths;
 mod shaders;
 mod stopwatch;
+mod poll;
+mod janitor;
 
 use maths::Vector2f;
 use maths::Matrix3f;
 use maths::Matrix4f;
 
 use stopwatch::Stopwatch;
+
+use janitor::Janitor;
 
 type R<T> = Result<T, Box<dyn Error + 'static>>;
 
@@ -82,7 +89,9 @@ struct App {
     conn: xcb::Connection,
     window: Window,
     gpu: Gpu,
+    janitor: Janitor,
     triangle_renderer: Option<TriangleRenderer>,
+    present_future: Option<Arc<FenceSignalFuture<Box<dyn GpuFuture + Send>>>>,
 }
 
 fn want_layer(layer: &LayerProperties) -> bool {
@@ -98,11 +107,13 @@ fn want_layer(layer: &LayerProperties) -> bool {
 fn init_vulkan(conn: &xcb::Connection, window: &x::Window) -> R<(Gpu, Arc<Surface<()>>, Format)> {
     let lib = VulkanLibrary::new()?;
 
-    /*let available_layers: Vec<_> =
-        lib.layer_properties()?
-        .map(|layer| format!("{}: {}", layer.name(), layer.description()))
-        .collect();
-    println!("Available layers: {available_layers:#?}");*/
+    dont!{
+        let available_layers: Vec<_> =
+            lib.layer_properties()?
+            .map(|layer| format!("{}: {}", layer.name(), layer.description()))
+            .collect();
+        println!("Available layers: {available_layers:#?}");
+    }
 
     let enabled_layers: Vec<_> =
         lib.layer_properties()?
@@ -110,7 +121,7 @@ fn init_vulkan(conn: &xcb::Connection, window: &x::Window) -> R<(Gpu, Arc<Surfac
         .map(|layer| String::from(layer.name()))
         .collect();
 
-    println!("Enabled layers: {enabled_layers:#?}");
+    dont!{ println!("Enabled layers: {enabled_layers:#?}"); }
 
     let extensions = InstanceExtensions {
         khr_surface: true,
@@ -127,9 +138,9 @@ fn init_vulkan(conn: &xcb::Connection, window: &x::Window) -> R<(Gpu, Arc<Surfac
 
     let phys_device = vki.enumerate_physical_devices()?.next().ok_or("no physical device")?;
     println!("Device: {}", phys_device.properties().device_name);
-    println!("Timestamp period: {}", phys_device.properties().timestamp_period);
+    dont!{ println!("Timestamp period: {}", phys_device.properties().timestamp_period); }
 
-    // println!("{:#?}", phys_device.supported_extensions());
+    dont!{ println!("{:#?}", phys_device.supported_extensions()); }
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
@@ -155,7 +166,7 @@ fn init_vulkan(conn: &xcb::Connection, window: &x::Window) -> R<(Gpu, Arc<Surfac
         phys_device.surface_formats(&surface, Default::default())?.into_iter().filter(|(format, _)| {
             *format == Format::R8G8B8A8_UNORM || *format == Format::B8G8R8A8_UNORM
         }).collect::<Vec<_>>().remove(0);
-    println!("Surface Format: {surface_format:?}");
+    dont!{ println!("Surface Format: {surface_format:?}"); }
 
     Ok((Gpu {
         phys_device,
@@ -197,6 +208,8 @@ fn init_app() -> R<App> {
 
     let (gpu, surface, surface_format) = init_vulkan(&conn, &window)?;
 
+    let janitor = Janitor::new();
+
     Ok(App {
         conn,
         window: Window {
@@ -207,7 +220,9 @@ fn init_app() -> R<App> {
             extent: None,
         },
         gpu,
+        janitor,
         triangle_renderer: None,
+        present_future: None,
     })
 }
 
@@ -394,7 +409,8 @@ fn render(app: &mut App, pos: [f32; 2], num_samples: i32) -> R<()> {
     let model_view =
         Matrix3f::scaling(stretch) *
         Matrix3f::translation(Vector2f::new(pos)) *
-        Matrix3f::uniform_scaling(circle_radius);
+        Matrix3f::uniform_scaling(circle_radius) *
+        Matrix3f::identity();
     let world = shaders::triangle::ty::World {
         viewport: [extent[0] as f32, extent[1] as f32],
         pos,
@@ -403,12 +419,6 @@ fn render(app: &mut App, pos: [f32; 2], num_samples: i32) -> R<()> {
     };
     let world_buffer = app.gpu.uniform_buffer_pool.from_data(world)?;
     watch.tick("world buffer");
-
-    let query_pool = QueryPool::new(app.gpu.device.clone(), QueryPoolCreateInfo {
-        query_count: 2,
-        .. QueryPoolCreateInfo::query_type(QueryType::Timestamp)
-    })?;
-    watch.tick("query pool");
 
     let layout = renderer.pipeline.layout().set_layouts()[0].clone();
     let set = PersistentDescriptorSet::new(layout, [WriteDescriptorSet::buffer(0, world_buffer.clone())])?;
@@ -428,8 +438,6 @@ fn render(app: &mut App, pos: [f32; 2], num_samples: i32) -> R<()> {
         origin: [0, 0],
         dimensions: extent,
     }));
-    unsafe { cb.reset_query_pool(query_pool.clone(), 0 .. 1)? };
-    unsafe { cb.write_timestamp(query_pool.clone(), 0, PipelineStage::TopOfPipe)? };
     cb.begin_render_pass(RenderPassBeginInfo {
         render_pass: renderer.render_pass,
         render_area_offset: [0, 0],
@@ -441,137 +449,183 @@ fn render(app: &mut App, pos: [f32; 2], num_samples: i32) -> R<()> {
     cb.bind_descriptor_sets(PipelineBindPoint::Graphics, renderer.pipeline.layout().clone(), 0, set);
     cb.draw(4, 1, 0, 0)?;
     cb.end_render_pass()?;
-    unsafe { cb.write_timestamp(query_pool.clone(), 1, PipelineStage::BottomOfPipe)? };
 
     let cmd = cb.build()?;
     watch.tick("build command buffer");
 
-    let future = image_future
+    let present_future = match std::mem::replace(&mut app.present_future, None) {
+        None => image_future.boxed_send(),
+        Some(mut last_future) => {
+            last_future.cleanup_finished();
+            last_future.join(image_future).boxed_send()
+        },
+    };
+    watch.tick("cleanup");
+
+    app.present_future = Some(Arc::new(
+        present_future
         .then_execute(app.gpu.queue.clone(), cmd)?
         .then_swapchain_present(app.gpu.queue.clone(), PresentInfo {
             index: image_index,
             .. PresentInfo::swapchain(frame.chain.clone())
-        });
-    watch.tick("submit");
-    future.flush()?;
+        })
+        .boxed_send()
+        .then_signal_fence_and_flush()?
+    ));
     watch.tick("flush");
 
-    let mut query_results = [0u64; 2];
-    /*query_pool.queries_range(0 .. 2).ok_or("query range")?.get_results(&mut query_results[0 .. 2], QueryResultFlags {
-        wait: true,
-        .. QueryResultFlags::empty()
-    })?;
-    watch.tick("query result");*/
-    let before = Duration::from_nanos(query_results[0] * 100);
-    let after = Duration::from_nanos(query_results[1] * 100);
-    println!("Rendering took {:?}", after - before);
-    let periods = watch.periods();
-    println!("{:?}", periods);
-    let total: Duration = periods.into_iter().map(|(_, dur)| dur).sum();
-    println!("Total: {total:?}");
+    dont!{
+        let periods = watch.periods();
+        println!("{:?}", periods);
+        let total: Duration = periods.into_iter().map(|(_, dur)| dur).sum();
+        println!("Total: {total:?}");
+    }
 
     Ok(())
 }
 
-fn get_events(conn: &xcb::Connection) -> R<Vec<xcb::Event>> {
-    let mut events = vec![conn.wait_for_event()?];
-    while let Some(event) = conn.poll_for_event()? {
-        events.push(event)
+#[derive(Debug)]
+enum Event {
+    Timeout,
+    GuiError(xcb::Error),
+    GuiEvent(Vec<xcb::Event>),
+}
+
+impl poll::Port<Event> for xcb::Connection {
+    fn port_fd(&self) -> libc::c_int {
+        self.as_raw_fd()
     }
-    Ok(events)
+
+    fn get_event(&self) -> Option<Event> {
+        match try {
+            let mut events = Vec::new();
+            while let Some(event) = self.poll_for_event()? {
+                events.push(event)
+            }
+            events
+        } {
+            Ok(events) => {
+                if events.is_empty() {
+                    None
+                } else {
+                    Some(Event::GuiEvent(events))
+                }
+            },
+            Err(err) => {
+                Some(Event::GuiError(err))
+            }
+        }
+    }
 }
 
 fn event_loop(mut app: App) -> R<()> {
-    let mut pos: [f32; 2] = [0.0, 0.0];
+    let mut last_action = Instant::now();
+    let mut pos: Vector2f = Vector2f::new([0.0, 0.0]);
+    let mut movements: VecDeque<(Instant, Vector2f)> = VecDeque::new();
     let mut num_samples = 1;
     loop {
-        for event in get_events(&app.conn)? {
+        let ports: [&dyn poll::Port<Event>; 1] = [&app.conn];
+        let poll_inst = Instant::now();
+        let timeout = movements.front().map(|(inst, _)| (inst.duration_since(poll_inst), Event::Timeout));
+        let events = poll::wait_for_event(ports, timeout);
+        let events_inst = Instant::now();
+        dont!{ println!("action {:?} / poll {:?}", poll_inst.duration_since(last_action), events_inst.duration_since(poll_inst)); }
+        last_action = events_inst;
+        let mut needs_render = false;
+        for event in events {
             match event {
-                xcb::Event::X(x::Event::KeyPress(ev)) => {
-                    let code = ev.detail();
-                    match code {
-                        0x09 =>
-                            return Ok(()),
-                        0x6F =>
-                            pos[1] -= 0.05,
-                        0x71 =>
-                            pos[0] -= 0.05,
-                        0x74 =>
-                            pos[1] += 0.05,
-                        0x72 =>
-                            pos[0] += 0.05,
-                        0x0A =>
-                            num_samples = 1,
-                        0x0B =>
-                            num_samples = 2,
-                        0x0C =>
-                            num_samples = 4,
-                        0x0D =>
-                            num_samples = 8,
-                        _ =>
-                            println!("Key: {code:#04x}")
+                Event::Timeout => {
+                    let now = Instant::now();
+                    while let Some((inst, dir)) = movements.pop_front() {
+                        if inst < now {
+                            dont!{ print!("move {dir:?} "); }
+                            pos = pos + dir;
+                            needs_render = true;
+                        } else {
+                            dont!{ println!("next {:?}", inst.duration_since(now)); }
+                            movements.push_front((inst, dir));
+                            break;
+                        }
+                    }
+                    if movements.is_empty() {
+                        dont!{ println!("done"); }
                     }
                 },
-                xcb::Event::X(x::Event::ConfigureNotify(ev)) => {
-                    if ev.window() == app.window.handle {
-                        app.window.extent = Some([ev.width() as u32, ev.height() as u32]);
+                Event::GuiError(err) => {
+                    Err(err)?
+                },
+                Event::GuiEvent(ref gui_events) => {
+                    for gui_event in gui_events {
+                        match gui_event {
+                            xcb::Event::X(x::Event::KeyPress(ev)) => {
+                                let code = ev.detail();
+                                match code {
+                                    0x09 =>
+                                        return Ok(()),
+                                    0x6F | 0x71 | 0x74 | 0x72 => {
+                                        let mut now = Instant::now() - Duration::from_millis(12);
+                                        let fractions = 22;
+                                        let dist = 0.05;
+                                        let dir = match code {
+                                            0x6F => Vector2f::new([0.0, -dist / fractions as f32]),
+                                            0x71 => Vector2f::new([-dist / fractions as f32, 0.0]),
+                                            0x74 => Vector2f::new([0.0, dist / fractions as f32]),
+                                            0x72 => Vector2f::new([dist / fractions as f32, 0.0]),
+                                            _ => unreachable!()
+                                        };
+                                        for _ in 0 .. fractions {
+                                            movements.push_back((now, dir));
+                                            now += Duration::from_millis(84 / fractions);
+                                        }
+                                    },
+                                    0x0A => {
+                                        needs_render = true;
+                                        num_samples = 1
+                                    },
+                                    0x0B => {
+                                        needs_render = true;
+                                        num_samples = 2
+                                    },
+                                    0x0C => {
+                                        needs_render = true;
+                                        num_samples = 4
+                                    },
+                                    0x0D => {
+                                        needs_render = true;
+                                        num_samples = 8
+                                    },
+                                    _ =>
+                                        println!("Key: {code:#04x}")
+                                }
+                            },
+                            xcb::Event::X(x::Event::ConfigureNotify(ev)) => {
+                                needs_render = true;
+                                if ev.window() == app.window.handle {
+                                    app.window.extent = Some([ev.width() as u32, ev.height() as u32]);
+                                }
+                            },
+                            xcb::Event::X(x::Event::Expose(_)) => {
+                                needs_render = true;
+                            },
+                            _ => {
+                                dont!{ println!("Event: {event:?}"); }
+                            }
+                        }
                     }
-                },
-                xcb::Event::X(x::Event::Expose(_)) => {
-                },
-                _ => {
-                    // println!("Event: {event:?}");
                 }
             }
         }
 
-        render(&mut app, pos, num_samples).map_err(RenderError::new)?;
-    }
-    /*
-    loop {
-        match app.conn.wait_for_event()? {
-            xcb::Event::X(x::Event::KeyPress(ev)) => {
-                let code = ev.detail();
-                if code == 0x09 {
-                    break Ok(())
-                } else {
-                    let keysym = app.conn.wait_for_reply(app.conn.send_request(&x::GetKeyboardMapping {
-                        first_keycode: code,
-                        count: 1,
-                    }))?;
-                    let syms = keysym.keysyms();
-                    let cs: Vec<char> = syms.iter().map(|&sym|
-                        if sym == 0 {
-                            '⊥'
-                        } else if 0xFD00 <= sym && sym <= 0xFFFF {
-                            '#'
-                        } else {
-                            char::from_u32(sym).unwrap_or('?')
-                        }).collect();
-                    let c = char::from_u32(syms[0]).unwrap();
-                    match c {
-                        'k' => colour = Colour::Black,
-                        'r' => colour = Colour::Red,
-                        'g' => colour = Colour::Green,
-                        'b' => colour = Colour::Blue,
-                        _ => {}
-                    }
-                    let state = ev.state().bits();
-                    // println!("{code} => {state:?} {c} {cs:?}");
-                }
-            },
-            xcb::Event::X(x::Event::Expose(ev)) => {
-                println!("Expose: {ev:?}");
-            },
-            _ => {}
+        if needs_render {
+            render(&mut app, pos.data(), num_samples).map_err(RenderError::new)?;
         }
-        render(&mut app, colour).map_err(RenderError::new)?
     }
-    */
 }
 
 pub fn run() -> R<()>{
     let app = init_app()?;
+    dont!{ println!("Init done"); }
+    dont!{ app.janitor.dispose(42)?; }
     show_window(&app)?;
     event_loop(app)
 }

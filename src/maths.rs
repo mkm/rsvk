@@ -8,7 +8,6 @@ fn n<T : From<i8>>(v: i8) -> T {
 pub struct Vector<Data>(Data);
 
 pub type Vector2f = Vector<[f32; 2]>;
-pub type Vector3f = Vector<[f32; 3]>;
 
 impl<T : Clone> Vector<T> {
     pub fn new(data: T) -> Self {
@@ -27,6 +26,16 @@ impl<T : Clone> Vector<[T; 2]> {
 
     pub fn y(&self) -> T {
         self.0[1].clone()
+    }
+}
+
+impl<T : Add> Add for Vector<[T; 2]> {
+    type Output = Vector<[<T as Add>::Output; 2]>;
+
+    fn add(self, that: Self) -> Self::Output {
+        let Vector([x1, y1]) = self;
+        let Vector([x2, y2]) = that;
+        Vector([x1 + x2, y1 + y2])
     }
 }
 
