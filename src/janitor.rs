@@ -1,7 +1,7 @@
-use std::thread::{self, JoinHandle};
-use std::sync::mpsc::{channel, Sender, SendError, RecvError};
 use std::error::Error;
 use std::fmt;
+use std::sync::mpsc::{channel, RecvError, SendError, Sender};
+use std::thread::{self, JoinHandle};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -24,8 +24,7 @@ impl fmt::Display for JanitorError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "could not contact janitor: ")?;
         match self {
-            JanitorError::Send(err) =>
-                err.fmt(f)
+            JanitorError::Send(err) => err.fmt(f),
         }
     }
 }
@@ -42,12 +41,10 @@ impl Janitor {
     pub fn new() -> Janitor {
         let (sender, receiver) = channel();
         Janitor {
-            thread: Some(thread::spawn(move || {
-                loop {
-                    match receiver.recv()? {
-                        Message::Execute(job) => job(),
-                        Message::Stop => return Ok(()),
-                    }
+            thread: Some(thread::spawn(move || loop {
+                match receiver.recv()? {
+                    Message::Execute(job) => job(),
+                    Message::Stop => return Ok(()),
                 }
             })),
             channel: sender,
@@ -59,7 +56,7 @@ impl Janitor {
         Ok(())
     }
 
-    pub fn dispose<T : Send + 'static>(&self, value: T) -> Result<(), JanitorError> {
+    pub fn dispose<T: Send + 'static>(&self, value: T) -> Result<(), JanitorError> {
         self.execute(move || drop(value))
     }
 }
@@ -67,6 +64,10 @@ impl Janitor {
 impl Drop for Janitor {
     fn drop(&mut self) {
         self.channel.send(Message::Stop).unwrap();
-        std::mem::replace(&mut self.thread, None).unwrap().join().unwrap().unwrap();
+        std::mem::replace(&mut self.thread, None)
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
     }
 }

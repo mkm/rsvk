@@ -70,3 +70,28 @@ impl<A0, A1, T, E> Cached for Box<dyn FnMut(A0, A1) -> Result<T, E>>
         })
     }
 }
+
+impl<A0, A1, A2, T, E> Cached for Box<dyn FnMut(A0, A1, A2) -> Result<T, E>>
+    where
+        A0: Clone + PartialEq + 'static,
+        A1: Clone + PartialEq + 'static,
+        A2: Clone + PartialEq + 'static,
+        T: Clone + 'static,
+        E: 'static,
+{
+    fn cached(mut self) -> Self {
+        let mut result: Option<(A0, A1, A2, T)> = None;
+        Box::new(move |a0, a1, a2| {
+            match &result {
+                Some((arg0, arg1, arg2, value)) if a0 == *arg0 && a1 == *arg1 && a2 == *arg2 => {
+                    Ok(value.clone())
+                },
+                _ => {
+                    let value = self(a0.clone(), a1.clone(), a2.clone())?;
+                    result = Some((a0, a1, a2, value.clone()));
+                    Ok(value)
+                }
+            }
+        })
+    }
+}

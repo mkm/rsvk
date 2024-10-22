@@ -1,65 +1,53 @@
 #![feature(try_blocks)]
+#![feature(never_type)]
+#![feature(exhaustive_patterns)]
 
-use std::error::Error;
 use std::borrow::Borrow;
-use std::sync::Arc;
 use std::collections::VecDeque;
-use std::time::{Instant, Duration};
+use std::error::Error;
 use std::os::unix::io::AsRawFd;
-use xcb::{x, Xid};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use vulkano::{
-    VulkanLibrary,
-    instance::{Instance, InstanceExtensions, InstanceCreateInfo, LayerProperties},
-    device::{Device, DeviceExtensions, Features, DeviceCreateInfo, Queue, QueueCreateInfo, physical::PhysicalDevice},
-    swapchain::{self, Swapchain, SwapchainCreateInfo, Surface, PresentMode, PresentInfo},
+    command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage},
+    descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet},
+    format::Format,
     image::{
-        ImageLayout,
-        ImageAccess,
-        ImageAspects,
-        ImageSubresourceRange,
         swapchain::SwapchainImage,
         view::{ImageView, ImageViewCreateInfo},
+        ImageAccess, ImageAspects, ImageSubresourceRange,
     },
-    format::{ClearValue, Format},
-    render_pass::{RenderPass, RenderPassCreateInfo, SubpassDescription, AttachmentDescription, AttachmentReference, LoadOp, StoreOp, Framebuffer, FramebufferCreateInfo},
-    command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, SubpassContents, RenderPassBeginInfo},
     pipeline::{
-        Pipeline,
-        PipelineBindPoint,
-        StateMode,
-        PartialStateMode,
-        graphics::{
-            GraphicsPipeline,
-            viewport::{ViewportState, Viewport, Scissor},
-            input_assembly::{InputAssemblyState, PrimitiveTopology},
-            color_blend::{ColorBlendState, ColorBlendAttachmentState, ColorComponents, AttachmentBlend},
-        },
+        graphics::viewport::{Scissor, Viewport},
+        Pipeline, PipelineBindPoint,
     },
-    sync::{GpuFuture, FenceSignalFuture},
-    buffer::cpu_pool::CpuBufferPool,
-    descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet},
+    render_pass::FramebufferCreateInfo,
+    swapchain::{self, PresentInfo, PresentMode, Surface, Swapchain, SwapchainCreateInfo},
+    sync::{FenceSignalFuture, GpuFuture},
 };
+use xcb::{x, Xid};
 
 #[macro_use]
 mod prelude;
-mod cached;
+#[macro_use]
+mod react;
+mod gpu;
+mod janitor;
 mod maths;
+mod poll;
+mod render;
 mod shaders;
 mod stopwatch;
-mod poll;
-mod janitor;
 
-use cached::Cached;
-
-use maths::Vector2f;
-use maths::Matrix3f;
-use maths::Matrix4f;
-
-use stopwatch::Stopwatch;
-
+use gpu::Gpu;
 use janitor::Janitor;
-
-type R<T> = Result<T, Box<dyn Error + 'static>>;
+use maths::{Matrix3f, Matrix4f, Vector2f};
+use prelude::*;
+use react::{CachedResultNode, ConstNode, Source};
+use render::{Framebuffer, GraphicsPipeline, RenderPass};
+use shaders::passes::SimplePass;
+use shaders::pipelines;
+use stopwatch::Stopwatch;
 
 #[derive(Clone)]
 struct Frame {
@@ -68,36 +56,21 @@ struct Frame {
 }
 
 struct Window {
-    handle: x::Window,
-    surface: Arc<Surface<()>>,
-    surface_format: Format,
+    handle: ConstNode<x::Window>,
+    surface: CachedResultNode<Arc<Surface<()>>, E>,
+    surface_format: CachedResultNode<Format, E>,
     frame: Option<Frame>,
-    extent: Option<[u32; 2]>,
+    extent: ConstNode<Option<[u32; 2]>>,
 }
-
-#[derive(Clone, Eq)]
-struct Gpu {
-    phys_device: Arc<PhysicalDevice>,
-    device: Arc<Device>,
-    queue: Arc<Queue>,
-    uniform_buffer_pool: Arc<CpuBufferPool<shaders::triangle::ty::World>>,
-}
-
-#[derive(Clone)]
-struct TriangleRenderer {
-    render_pass: Arc<RenderPass>,
-    pipeline: Arc<GraphicsPipeline>,
-}
-
-type CreateTriangleRenderer = dyn FnMut(Gpu, Format) -> R<TriangleRenderer>;
 
 struct App {
     running: bool,
-    conn: xcb::Connection,
+    conn: ConstNode<Arc<xcb::Connection>>,
     window: Window,
-    gpu: Gpu,
+    gpu: CachedResultNode<Gpu, E>,
     janitor: Janitor,
-    triangle_renderer: Box<CreateTriangleRenderer>,
+    simple_pass: CachedResultNode<RenderPass<SimplePass>, E>,
+    player_pipeline: CachedResultNode<GraphicsPipeline<pipelines::player::Pipeline>, E>, // Box<CreatePlayerPipeline>,
     present_future: Option<Arc<FenceSignalFuture<Box<dyn GpuFuture + Send>>>>,
     needs_render: bool,
     num_samples: i32,
@@ -105,92 +78,31 @@ struct App {
     movements: VecDeque<(Instant, Vector2f)>,
 }
 
-impl PartialEq for Gpu {
-    fn eq(&self, that: &Self) -> bool {
-        Arc::ptr_eq(&self.device, &that.device)
-    }
-}
-
-fn want_layer(layer: &LayerProperties) -> bool {
-    if cfg!(feature = "validation") && layer.name().contains("validation") {
-        true
-    } else if cfg!(feature = "api_dump") && layer.name().contains("api_dump") {
-        true
-    } else {
-        false
-    }
-}
-
-fn init_vulkan(conn: &xcb::Connection, window: &x::Window) -> R<(Gpu, Arc<Surface<()>>, Format)> {
-    let lib = VulkanLibrary::new()?;
-
-    dont!{
-        let available_layers: Vec<_> =
-            lib.layer_properties()?
-            .map(|layer| format!("{}: {}", layer.name(), layer.description()))
-            .collect();
-        println!("Available layers: {available_layers:#?}");
-    }
-
-    let enabled_layers: Vec<_> =
-        lib.layer_properties()?
-        .filter(want_layer)
-        .map(|layer| String::from(layer.name()))
-        .collect();
-
-    dont!{ println!("Enabled layers: {enabled_layers:#?}"); }
-
-    let extensions = InstanceExtensions {
-        khr_surface: true,
-        khr_xcb_surface: true,
-        khr_display: true,
-        ext_display_surface_counter: true,
-        .. InstanceExtensions::empty()
-    };
-    let vki = Instance::new(lib, InstanceCreateInfo {
-        enabled_extensions: extensions,
-        enabled_layers,
-        .. Default::default()
-    })?;
-
-    let phys_device = vki.enumerate_physical_devices()?.next().ok_or("no physical device")?;
-    println!("Device: {}", phys_device.properties().device_name);
-    dont!{ println!("Timestamp period: {}", phys_device.properties().timestamp_period); }
-
-    dont!{ println!("{:#?}", phys_device.supported_extensions()); }
-
-    let device_extensions = DeviceExtensions {
-        khr_swapchain: true,
-        ext_display_control: true,
-        .. DeviceExtensions::empty()
+fn init_surface(
+    gpu: Gpu,
+    conn: &xcb::Connection,
+    window: &x::Window,
+) -> R<(Arc<Surface<()>>, Format)> {
+    let surface: Arc<Surface<()>> = unsafe {
+        Surface::from_xcb(
+            gpu.device.instance().clone(),
+            conn.get_raw_conn(),
+            window.resource_id(),
+            (),
+        )?
     };
 
-    let (device, mut queues_iter) = Device::new(phys_device.clone(), DeviceCreateInfo {
-        enabled_extensions: device_extensions,
-        enabled_features: Features::empty(),
-        queue_create_infos: vec![QueueCreateInfo {
-            queue_family_index: 0,
-            .. Default::default()
-        }],
-        .. Default::default()
-    })?;
-    let queue = queues_iter.next().ok_or("no queue")?;
-    let uniform_buffer_pool = Arc::new(CpuBufferPool::uniform_buffer(device.clone()));
-
-    let surface: Arc<Surface<()>> = unsafe { Surface::from_xcb(vki, conn.get_raw_conn(), window.resource_id(), ())? };
-
-    let (surface_format, _surface_colour_space) =
-        phys_device.surface_formats(&surface, Default::default())?.into_iter().filter(|(format, _)| {
+    let (surface_format, _surface_colour_space) = gpu
+        .phys_device
+        .surface_formats(&surface, Default::default())?
+        .into_iter()
+        .filter(|(format, _)| {
             *format == Format::R8G8B8A8_UNORM || *format == Format::B8G8R8A8_UNORM
-        }).collect::<Vec<_>>().remove(0);
-    dont!{ println!("Surface Format: {surface_format:?}"); }
+        })
+        .collect::<Vec<_>>()
+        .remove(0);
 
-    Ok((Gpu {
-        phys_device,
-        device,
-        queue,
-        uniform_buffer_pool,
-    }, surface, surface_format))
+    Ok((surface, surface_format))
 }
 
 fn init_app() -> R<App> {
@@ -210,9 +122,9 @@ fn init_app() -> R<App> {
         border_width: 0,
         class: x::WindowClass::InputOutput,
         visual: screen.root_visual(),
-        value_list: &[
-            x::Cw::EventMask(x::EventMask::EXPOSURE | x::EventMask::KEY_PRESS | x::EventMask::STRUCTURE_NOTIFY)
-        ],
+        value_list: &[x::Cw::EventMask(
+            x::EventMask::EXPOSURE | x::EventMask::KEY_PRESS | x::EventMask::STRUCTURE_NOTIFY,
+        )],
     }))?;
 
     conn.check_request(conn.send_request_checked(&x::ChangeProperty {
@@ -223,13 +135,25 @@ fn init_app() -> R<App> {
         data: "これは窓かな🙃".as_bytes(),
     }))?;
 
-    let (gpu, surface, surface_format) = init_vulkan(&conn, &window)?;
+    let gpu = cached_result!(|| Gpu::new());
+    let conn = ConstNode::new(Arc::new(conn));
+    let window = ConstNode::new(window);
+    let surface_and_format = cached_result!(|gpu, conn, window| init_surface(gpu?, &conn, &window));
+    let surface = surface_and_format.map(|sf| sf.0);
+    let surface_format = surface_and_format.map(|sf| sf.1);
 
     let janitor = Janitor::new();
-    let triangle_renderer =
-        (Box::new(|gpu: Gpu, format: Format| {
-            gpu.create_triangle_renderer(format)
-        }) as Box<CreateTriangleRenderer>).cached();
+    let simple_pass = cached_result!(|gpu, surface_format| RenderPass::new(
+        gpu?,
+        SimplePass {
+            format: surface_format?
+        }
+    ));
+    let player_pipeline = cached_result!(|gpu, simple_pass| GraphicsPipeline::new(
+        gpu?,
+        pipelines::player::Pipeline {},
+        &simple_pass?
+    ));
 
     Ok(App {
         running: true,
@@ -239,65 +163,18 @@ fn init_app() -> R<App> {
             surface,
             surface_format,
             frame: None,
-            extent: None,
+            extent: ConstNode::new(None),
         },
         gpu,
         janitor,
-        triangle_renderer,
+        simple_pass,
+        player_pipeline,
         present_future: None,
         needs_render: false,
         num_samples: 1,
         position: Vector2f::new([0.0, 0.0]),
         movements: VecDeque::new(),
     })
-}
-
-impl Gpu {
-    fn create_triangle_renderer(&self, format: Format) -> R<TriangleRenderer> {
-        let render_pass = RenderPass::new(self.device.clone(), RenderPassCreateInfo {
-            attachments: vec![AttachmentDescription {
-                format: Some(format),
-                load_op: LoadOp::Clear,
-                store_op: StoreOp::Store,
-                initial_layout: ImageLayout::Undefined,
-                final_layout: ImageLayout::PresentSrc,
-                .. Default::default()
-            }],
-            subpasses: vec![SubpassDescription {
-                color_attachments: vec![Some(AttachmentReference {
-                    attachment: 0,
-                    layout: ImageLayout::General,
-                    .. Default::default()
-                })],
-                .. Default::default()
-            }],
-            .. Default::default()
-        })?;
-
-        let pipeline = GraphicsPipeline::start()
-            .render_pass(render_pass.clone().first_subpass())
-            .viewport_state(ViewportState::viewport_dynamic_scissor_dynamic(1))
-            .input_assembly_state(InputAssemblyState {
-                topology: PartialStateMode::Fixed(PrimitiveTopology::TriangleStrip),
-                .. Default::default()
-            })
-            .vertex_shader(shaders::triangle::load_vertex(self.device.clone())?.entry_point("main").ok_or("vertex_entry_point")?, ())
-            .fragment_shader(shaders::triangle::load_fragment(self.device.clone())?.entry_point("main").ok_or("fragment entry point")?, ())
-            .color_blend_state(ColorBlendState {
-                attachments: vec![ColorBlendAttachmentState {
-                    blend: Some(AttachmentBlend::alpha()),
-                    color_write_mask: ColorComponents::all(),
-                    color_write_enable: StateMode::Fixed(true),
-                }],
-                .. Default::default()
-            })
-            .build(self.device.clone())?;
-
-        Ok(TriangleRenderer {
-            render_pass,
-            pipeline,
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -322,7 +199,6 @@ impl Error for RenderError {
         Some(self.cause.borrow())
     }
 }
-
 
 #[derive(Debug)]
 enum Event {
@@ -350,10 +226,8 @@ impl poll::Port<Event> for xcb::Connection {
                 } else {
                     Some(Event::GuiEvent(events))
                 }
-            },
-            Err(err) => {
-                Some(Event::GuiError(err))
             }
+            Err(err) => Some(Event::GuiError(err)),
         }
     }
 }
@@ -378,31 +252,30 @@ impl AppEvent for x::KeyPressEvent {
                     0x71 => Vector2f::new([-dist / fractions as f32, 0.0]),
                     0x74 => Vector2f::new([0.0, dist / fractions as f32]),
                     0x72 => Vector2f::new([dist / fractions as f32, 0.0]),
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 };
-                for _ in 0 .. fractions {
+                for _ in 0..fractions {
                     app.movements.push_back((now, dir));
                     now += Duration::from_millis(84 / fractions);
                 }
-            },
+            }
             0x0A => {
                 app.needs_render = true;
                 app.num_samples = 1
-            },
+            }
             0x0B => {
                 app.needs_render = true;
                 app.num_samples = 2
-            },
+            }
             0x0C => {
                 app.needs_render = true;
                 app.num_samples = 4
-            },
+            }
             0x0D => {
                 app.needs_render = true;
                 app.num_samples = 8
-            },
-            _ =>
-                println!("Key: {code:#04x} {:?}", self.time())
+            }
+            _ => println!("Key: {code:#04x} {:?}", self.time()),
         }
 
         Ok(())
@@ -412,8 +285,10 @@ impl AppEvent for x::KeyPressEvent {
 impl AppEvent for x::ConfigureNotifyEvent {
     fn handle_event(self, app: &mut App) -> R<()> {
         app.needs_render = true;
-        if self.window() == app.window.handle {
-            app.window.extent = Some([self.width() as u32, self.height() as u32]);
+        if self.window() == app.window.handle.get() {
+            app.window
+                .extent
+                .put(Some([self.width() as u32, self.height() as u32]));
         }
         Ok(())
     }
@@ -429,17 +304,11 @@ impl AppEvent for x::ExposeEvent {
 impl AppEvent for xcb::Event {
     fn handle_event(self, app: &mut App) -> R<()> {
         match self {
-            xcb::Event::X(x::Event::KeyPress(ev)) => {
-                app.handle_event(ev)
-            },
-            xcb::Event::X(x::Event::ConfigureNotify(ev)) => {
-                app.handle_event(ev)
-            },
-            xcb::Event::X(x::Event::Expose(ev)) => {
-                app.handle_event(ev)
-            },
+            xcb::Event::X(x::Event::KeyPress(ev)) => app.handle_event(ev),
+            xcb::Event::X(x::Event::ConfigureNotify(ev)) => app.handle_event(ev),
+            xcb::Event::X(x::Event::Expose(ev)) => app.handle_event(ev),
             _ => {
-                dont!{ println!("Event: {self:?}"); };
+                dont! { println!("Event: {self:?}"); };
                 Ok(())
             }
         }
@@ -453,22 +322,22 @@ impl AppEvent for Event {
                 let now = Instant::now();
                 while let Some((inst, dir)) = app.movements.pop_front() {
                     if inst < now {
-                        dont!{ print!("move {dir:?} "); }
+                        dont! { print!("move {dir:?} "); }
                         app.position = app.position + dir;
                         app.needs_render = true;
                     } else {
-                        dont!{ println!("next {:?}", inst.duration_since(now)); }
+                        dont! { println!("next {:?}", inst.duration_since(now)); }
                         app.movements.push_front((inst, dir));
                         break;
                     }
                 }
                 if app.movements.is_empty() {
-                    dont!{ println!("done"); }
+                    dont! { println!("done"); }
                 }
-            },
+            }
             Event::GuiError(err) => {
                 Err(err)?;
-            },
+            }
             Event::GuiEvent(gui_events) => {
                 for gui_event in gui_events {
                     app.handle_event(gui_event)?;
@@ -481,38 +350,45 @@ impl AppEvent for Event {
 
 impl App {
     fn show_window(&self) -> R<()> {
-        Ok(self.conn.check_request(self.conn.send_request_checked(&x::MapWindow {
-            window: self.window.handle
+        let conn = self.conn.get();
+        Ok(conn.check_request(conn.send_request_checked(&x::MapWindow {
+            window: self.window.handle.get(),
         }))?)
     }
 
     fn create_frame(&self) -> R<Frame> {
-        let caps = self.gpu.phys_device.surface_capabilities(&self.window.surface, Default::default())?;
-        let (chain, images) = Swapchain::new(self.gpu.device.clone(), self.window.surface.clone(), SwapchainCreateInfo {
-            min_image_count: caps.min_image_count,
-            image_format: Some(self.window.surface_format),
-            image_usage: caps.supported_usage_flags,
-            present_mode: PresentMode::Mailbox,
-            .. Default::default()
-        })?;
-        Ok(Frame {
-            chain,
-            images,
-        })
+        let gpu = self.gpu.get()?;
+        let surface = self.window.surface.get()?;
+        let caps = gpu
+            .phys_device
+            .surface_capabilities(&surface, Default::default())?;
+        let (chain, images) = Swapchain::new(
+            gpu.device.clone(),
+            self.window.surface.get()?.clone(),
+            SwapchainCreateInfo {
+                min_image_count: caps.min_image_count,
+                image_format: Some(self.window.surface_format.get()?),
+                image_usage: caps.supported_usage_flags,
+                present_mode: PresentMode::Mailbox,
+                ..Default::default()
+            },
+        )?;
+        Ok(Frame { chain, images })
     }
 
     fn recreate_frame(&self, frame: &Frame) -> R<Frame> {
-        let caps = self.gpu.phys_device.surface_capabilities(&self.window.surface, Default::default())?;
+        let gpu = self.gpu.get()?;
+        let surface = self.window.surface.get()?;
+        let caps = gpu
+            .phys_device
+            .surface_capabilities(&surface, Default::default())?;
         let (chain, images) = frame.chain.recreate(SwapchainCreateInfo {
             min_image_count: caps.min_image_count,
             image_usage: caps.supported_usage_flags,
             present_mode: PresentMode::Mailbox,
-            .. Default::default()
+            ..Default::default()
         })?;
-        Ok(Frame {
-            chain,
-            images,
-        })
+        Ok(Frame { chain, images })
     }
 
     fn ensure_frame(&mut self, extent: [u32; 2]) -> R<Frame> {
@@ -521,8 +397,8 @@ impl App {
                 let frame = self.create_frame()?;
                 self.window.frame = Some(frame.clone());
                 Ok(frame)
-            },
-            Some(ref frame) =>
+            }
+            Some(ref frame) => {
                 if frame.chain.image_extent() == extent {
                     Ok(frame.clone())
                 } else {
@@ -530,46 +406,57 @@ impl App {
                     self.window.frame = Some(frame.clone());
                     Ok(frame)
                 }
+            }
         }
     }
 
     fn render(&mut self) -> R<()> {
         let mut watch: Stopwatch<&'static str> = Stopwatch::new();
+        let gpu = self.gpu.get()?;
 
-        let extent = match self.window.extent {
+        let extent = match self.window.extent.get() {
             Some(ext) => ext,
-            None => return Ok(())
+            None => return Ok(()),
         };
 
         let viewport = Vector2f::new([extent[0] as f32, extent[1] as f32]);
 
         let frame = self.ensure_frame(extent)?;
         watch.tick("ensure frame");
-        let renderer = (self.triangle_renderer)(self.gpu.clone(), self.window.surface_format)?;
-        watch.tick("ensure renderer");
+        let render_pass = self.simple_pass.get()?;
+        watch.tick("ensure render pass");
+        let pipeline = self.player_pipeline.get()?;
+        watch.tick("ensure pipeline");
 
-        let (image_index, _, image_future) = swapchain::acquire_next_image(frame.chain.clone(), None)?;
+        let (image_index, _, image_future) =
+            swapchain::acquire_next_image(frame.chain.clone(), None)?;
         let image = frame.images[image_index].clone();
         watch.tick("acquire");
 
-        let image_view = ImageView::new(image.clone(), ImageViewCreateInfo {
-            format: Some(image.format()),
-            subresource_range: ImageSubresourceRange {
-                aspects: ImageAspects {
-                    color: true,
-                    .. ImageAspects::empty()
+        let image_view = ImageView::new(
+            image.clone(),
+            ImageViewCreateInfo {
+                format: Some(image.format()),
+                subresource_range: ImageSubresourceRange {
+                    aspects: ImageAspects {
+                        color: true,
+                        ..ImageAspects::empty()
+                    },
+                    mip_levels: 0..1,
+                    array_layers: 0..1,
                 },
-                mip_levels: 0 .. 1,
-                array_layers: 0 .. 1,
+                ..Default::default()
             },
-            .. Default::default()
-        })?;
+        )?;
         watch.tick("image view");
 
-        let framebuffer = Framebuffer::new(renderer.render_pass.clone(), FramebufferCreateInfo {
-            attachments: vec![image_view],
-            .. Default::default()
-        })?;
+        let framebuffer = Framebuffer::new(
+            render_pass.clone(),
+            FramebufferCreateInfo {
+                attachments: vec![image_view],
+                ..Default::default()
+            },
+        )?;
         watch.tick("framebuffer");
 
         let stretch = if viewport.x() > viewport.y() {
@@ -578,49 +465,57 @@ impl App {
             Vector2f::new([1.0, viewport.x() / viewport.y()])
         };
         let circle_radius = 0.08;
-        let model_view =
-            Matrix3f::scaling(stretch) *
-            Matrix3f::translation(self.position) *
-            Matrix3f::uniform_scaling(circle_radius) *
-            Matrix3f::identity();
+        let model_view = Matrix3f::scaling(stretch)
+            * Matrix3f::translation(self.position)
+            * Matrix3f::uniform_scaling(circle_radius)
+            * Matrix3f::identity();
         let world = shaders::triangle::ty::World {
             viewport: [extent[0] as f32, extent[1] as f32],
             pos: self.position.data(),
             modelView: Matrix4f::embed_matrix3(model_view.transpose()).data(),
             numSamples: self.num_samples,
         };
-        let world_buffer = self.gpu.uniform_buffer_pool.from_data(world)?;
+        let world_buffer = gpu.uniform_buffer_pool.from_data(world)?;
         watch.tick("world buffer");
 
-        let layout = renderer.pipeline.layout().set_layouts()[0].clone();
-        let set = PersistentDescriptorSet::new(layout, [WriteDescriptorSet::buffer(0, world_buffer.clone())])?;
+        let layout = pipeline.handle().layout().set_layouts()[0].clone();
+        let set = PersistentDescriptorSet::new(
+            layout,
+            [WriteDescriptorSet::buffer(0, world_buffer.clone())],
+        )?;
         watch.tick("descriptor set");
 
         let mut cb = AutoCommandBufferBuilder::primary(
-            self.gpu.device.clone(),
-            self.gpu.queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit)?;
+            gpu.device.clone(),
+            gpu.queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )?;
 
-        cb.set_viewport(0, Some(Viewport {
-            origin: [0.0, 0.0],
-            dimensions: [extent[0] as f32, extent[1] as f32],
-            depth_range: 0.0 .. 1.0,
-        }));
-        cb.set_scissor(0, Some(Scissor {
-            origin: [0, 0],
-            dimensions: extent,
-        }));
-        cb.begin_render_pass(RenderPassBeginInfo {
-            render_pass: renderer.render_pass,
-            render_area_offset: [0, 0],
-            render_area_extent: framebuffer.extent(),
-            clear_values: vec![Some(ClearValue::Float([0.05, 0.03, 0.12, 1.0]))],
-            .. RenderPassBeginInfo::framebuffer(framebuffer)
-        }, SubpassContents::Inline)?;
-        cb.bind_pipeline_graphics(renderer.pipeline.clone());
-        cb.bind_descriptor_sets(PipelineBindPoint::Graphics, renderer.pipeline.layout().clone(), 0, set);
+        cb.set_viewport(
+            0,
+            Some(Viewport {
+                origin: [0.0, 0.0],
+                dimensions: [extent[0] as f32, extent[1] as f32],
+                depth_range: 0.0..1.0,
+            }),
+        );
+        cb.set_scissor(
+            0,
+            Some(Scissor {
+                origin: [0, 0],
+                dimensions: extent,
+            }),
+        );
+        let active_render_pass = framebuffer.begin_render_pass(&mut cb, [0.05, 0.03, 0.12, 1.0])?;
+        cb.bind_pipeline_graphics(pipeline.handle().clone());
+        cb.bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            pipeline.handle().layout().clone(),
+            0,
+            set,
+        );
         cb.draw(4, 1, 0, 0)?;
-        cb.end_render_pass()?;
+        framebuffer.end_render_pass(&mut cb, active_render_pass)?;
 
         let cmd = cb.build()?;
         watch.tick("build command buffer");
@@ -630,23 +525,26 @@ impl App {
             Some(mut last_future) => {
                 last_future.cleanup_finished();
                 last_future.join(image_future).boxed_send()
-            },
+            }
         };
         watch.tick("cleanup");
 
         self.present_future = Some(Arc::new(
             present_future
-            .then_execute(self.gpu.queue.clone(), cmd)?
-            .then_swapchain_present(self.gpu.queue.clone(), PresentInfo {
-                index: image_index,
-                .. PresentInfo::swapchain(frame.chain.clone())
-            })
-            .boxed_send()
-            .then_signal_fence_and_flush()?
+                .then_execute(gpu.queue.clone(), cmd)?
+                .then_swapchain_present(
+                    gpu.queue.clone(),
+                    PresentInfo {
+                        index: image_index,
+                        ..PresentInfo::swapchain(frame.chain.clone())
+                    },
+                )
+                .boxed_send()
+                .then_signal_fence_and_flush()?,
         ));
         watch.tick("flush");
 
-        dont!{
+        dont! {
             let periods = watch.periods();
             println!("{:?}", periods);
             let total: Duration = periods.into_iter().map(|(_, dur)| dur).sum();
@@ -662,12 +560,16 @@ impl App {
     fn event_loop(mut self) -> R<()> {
         let mut last_action = Instant::now();
         while self.running {
-            let ports: [&dyn poll::Port<Event>; 1] = [&self.conn];
+            let conn = self.conn.get();
+            let ports: [&dyn poll::Port<Event>; 1] = [&*conn];
             let poll_inst = Instant::now();
-            let timeout = self.movements.front().map(|(inst, _)| (inst.duration_since(poll_inst), Event::Timeout));
+            let timeout = self
+                .movements
+                .front()
+                .map(|(inst, _)| (inst.duration_since(poll_inst), Event::Timeout));
             let events = poll::wait_for_event(ports, timeout);
             let events_inst = Instant::now();
-            dont!{ println!("action {:?} / poll {:?}", poll_inst.duration_since(last_action), events_inst.duration_since(poll_inst)); }
+            dont! { println!("action {:?} / poll {:?}", poll_inst.duration_since(last_action), events_inst.duration_since(poll_inst)); }
             last_action = events_inst;
 
             for event in events {
@@ -684,10 +586,10 @@ impl App {
     }
 }
 
-pub fn run() -> R<()>{
+pub fn run() -> R<()> {
     let app = init_app()?;
-    dont!{ println!("Init done"); }
-    dont!{ app.janitor.dispose(42)?; }
+    dont! { println!("Init done"); }
+    dont! { app.janitor.dispose(42)?; }
     app.show_window()?;
     app.event_loop()
 }

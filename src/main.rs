@@ -1,5 +1,5 @@
-use std::error::Error;
 use std::borrow::Borrow;
+use std::error::Error;
 
 fn print_error_message<'a>(err: &(dyn Error + 'a)) {
     print!("{err}");
@@ -13,8 +13,7 @@ fn main() {
     std::panic::set_hook(Box::new(|_| {}));
 
     match rsvk::run() {
-        Ok(()) =>
-            {},
+        Ok(()) => {}
         Err(e) => {
             println!("{e:#?}");
             print!("ERROR: ");
